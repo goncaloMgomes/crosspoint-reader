@@ -111,4 +111,11 @@ class KOReaderSyncActivity final : public Activity {
   bool computeLocalProgressAndChapter();
   void computeRemoteChapter();
   bool ensureRemotePositionMapped(bool closeSessionBeforeMapping = true);
+  bool calculateDocumentHash();
+  void compare();
+  void pullRemote();
+  void pushLocal();
+  void updateUI(State newState, auto&& runInCriticalSection, bool wait = false);
+  void prepareRemoteMapping();
+  bool fetchRemoteProgress();
 };

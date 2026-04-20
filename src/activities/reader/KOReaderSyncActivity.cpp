@@ -96,21 +96,8 @@ void KOReaderSyncActivity::onWifiSelectionComplete(const bool success) {
 }
 
 void KOReaderSyncActivity::performSync() {
-  // Calculate document hash based on user's preferred method
-  if (KOREADER_STORE.getMatchMethod() == DocumentMatchMethod::FILENAME) {
-    documentHash = KOReaderDocumentId::calculateFromFilename(epubPath);
-  } else {
-    documentHash = KOReaderDocumentId::calculate(epubPath);
-  }
-  if (documentHash.empty()) {
-    {
-      RenderLock lock(*this);
-      state = SYNC_FAILED;
-      statusMessage = tr(STR_HASH_FAILED);
-    }
-    requestUpdate(true);
-    return;
-  }
+
+  if (!calculateDocumentHash()) return;
 
   LOG_DBG("KOSync", "Document hash: %s", documentHash.c_str());
 
@@ -120,18 +107,11 @@ void KOReaderSyncActivity::performSync() {
     // Precompute local mapping before first network request so the expensive
     // inflate/index work happens before TLS. This avoids a second local mapping
     // pass later and keeps the upload path lightweight.
-    {
-      RenderLock lock(*this);
-      statusMessage = tr(STR_MAPPING_LOCAL);
-    }
-    requestUpdateAndWait();
+
+    updateUI(state, []() {tr(STR_MAPPING_LOCAL);}, true);
+
     if (!computeLocalProgressAndChapter()) {
-      {
-        RenderLock lock(*this);
-        state = SYNC_FAILED;
-        statusMessage = tr(STR_SYNC_FAILED_MSG);
-      }
-      requestUpdate(true);
+      updateUI(SYNC_FAILED,[]() {tr(STR_SYNC_FAILED_MSG);});
       return;
     }
   }
@@ -139,176 +119,20 @@ void KOReaderSyncActivity::performSync() {
   // Drop EPUB state before HTTPS to maximize contiguous heap for TLS.
   releaseEpubForMapping();
 
-  // Push intent skips comparison UI but still warms an HTTP/TLS session first
-  // so PUT can reuse the connection instead of forcing a fresh handshake.
-  if (syncIntent == KOReaderSyncIntentState::PUSH_LOCAL) {
-    // Direct push previously started with no reusable HTTP/TLS session, forcing
-    // a fresh handshake in updateProgress. Compare flow often succeeds because
-    // upload reuses the GET session. Warm the session here so push can take the
-    // same reuse path without showing comparison UI.
-    KOReaderSyncClient::beginPersistentSession();
-    KOReaderProgress warmupProgress;
-    const auto warmupResult = KOReaderSyncClient::getProgress(documentHash, warmupProgress);
-    if (warmupResult != KOReaderSyncClient::OK && warmupResult != KOReaderSyncClient::NOT_FOUND) {
-      KOReaderSyncClient::endPersistentSession();
-      {
-        RenderLock lock(*this);
-        state = SYNC_FAILED;
-        statusMessage = KOReaderSyncClient::errorString(warmupResult);
-        const char* detail = KOReaderSyncClient::lastFailureDetail();
-        if (detail && detail[0]) {
-          statusMessage += " — ";
-          statusMessage += detail;
-        }
-      }
-      requestUpdate(true);
-      return;
-    }
-    performUpload();
-    return;
+  switch(syncIntent){
+    case KOReaderSyncIntentState::COMPARE: {
+      compare();
+      break;
   }
-
-  {
-    RenderLock lock(*this);
-    statusMessage = tr(STR_FETCH_PROGRESS);
-  }
-  requestUpdate();
-
-  // Keep the GET connection alive so Upload can reuse the same session and
-  // avoid a second TLS handshake under fragmented heap.
-  KOReaderSyncClient::beginPersistentSession();
-
-  // Fetch remote progress
-  const auto result = KOReaderSyncClient::getProgress(documentHash, remoteProgress);
-
-  if (result == KOReaderSyncClient::NOT_FOUND) {
-    if (syncIntent == KOReaderSyncIntentState::PULL_REMOTE) {
-      // Pull intent must not silently fall back to upload when server has no
-      // remote progress. Failing explicitly keeps action semantics predictable.
-      KOReaderSyncClient::endPersistentSession();
-      {
-        RenderLock lock(*this);
-        state = SYNC_FAILED;
-        statusMessage = tr(STR_NO_REMOTE_MSG);
+    case KOReaderSyncIntentState::PUSH_LOCAL: {
+      pushLocal();
+      break;
       }
-      requestUpdate(true);
-      return;
+    case KOReaderSyncIntentState::PULL_REMOTE: {
+      pullRemote();
+      break;
     }
-
-    // Keep session open so an immediate upload can reuse the same connection.
-    // No remote progress - offer to upload
-    {
-      RenderLock lock(*this);
-      state = NO_REMOTE_PROGRESS;
-      hasRemoteProgress = false;
-    }
-    requestUpdate(true);
-    return;
   }
-
-  if (result != KOReaderSyncClient::OK) {
-    KOReaderSyncClient::endPersistentSession();
-    {
-      RenderLock lock(*this);
-      state = SYNC_FAILED;
-      // Combine the short category label with the rich diagnostic so users (and bug
-      // reports) can tell network/TLS/server/heap failures apart at a glance.
-      statusMessage = KOReaderSyncClient::errorString(result);
-      const char* detail = KOReaderSyncClient::lastFailureDetail();
-      if (detail && detail[0]) {
-        statusMessage += " — ";
-        statusMessage += detail;
-      }
-    }
-    requestUpdate(true);
-    return;
-  }
-
-  // Prepare remote mapping state for the next step.
-  hasRemoteProgress = false;
-  remotePositionMapped = false;
-  remotePosition.spineIndex = -1;
-  remotePosition.pageNumber = -1;
-  remotePosition.totalPages = 0;
-  remotePosition.paragraphIndex = 0;
-  remotePosition.hasParagraphIndex = false;
-  remoteChapterLabel.clear();
-
-  if (syncIntent == KOReaderSyncIntentState::PULL_REMOTE) {
-    // Pull intent applies immediately and exits. We bypass chooser UI to keep
-    // reader menu actions deterministic ("pull" always means apply remote).
-    if (!ensureRemotePositionMapped()) {
-      {
-        RenderLock lock(*this);
-        state = SYNC_FAILED;
-        statusMessage = tr(STR_SYNC_FAILED_MSG);
-      }
-      requestUpdate(true);
-      return;
-    }
-
-    // Preserve the apply result and show explicit confirmation before returning
-    // to the reader so users can tell pull succeeded.
-    auto& sync = APP_STATE.koReaderSyncSession;
-    sync.outcome = KOReaderSyncOutcomeState::APPLIED_REMOTE;
-    sync.resultSpineIndex = remotePosition.spineIndex;
-    sync.resultPage = remotePosition.pageNumber;
-    sync.resultParagraphIndex = remotePosition.paragraphIndex;
-    sync.resultHasParagraphIndex = remotePosition.hasParagraphIndex;
-    APP_STATE.saveToFile();
-    {
-      RenderLock lock(*this);
-      state = APPLY_COMPLETE;
-      uploadCompleteTime = millis();
-    }
-    requestUpdate(true);
-    return;
-  }
-
-  // Compare intent keeps the legacy chooser flow (apply vs upload), which is
-  // still useful for manual conflict decisions.
-  // Pre-map remote progress now so compare UI always shows concrete chapter/
-  // page data. The mapped result is cached and reused if Apply is chosen.
-  if (!ensureRemotePositionMapped(false)) {
-    {
-      RenderLock lock(*this);
-      state = SYNC_FAILED;
-      statusMessage = tr(STR_SYNC_FAILED_MSG);
-    }
-    requestUpdate(true);
-    return;
-  }
-
-  // Local progress was precomputed before network; keep using the cached value.
-  releaseEpubForMapping();
-
-  {
-    RenderLock lock(*this);
-    state = SHOWING_RESULT;
-
-    // Default to the option that corresponds to the furthest progress.
-    // Compare in the shared CrossPoint coordinate system (spine → page → paragraph)
-    // rather than percentage, since percentages are derived differently on each
-    // side and lose resolution. Remote has already been mapped via
-    // ensureRemotePositionMapped() at this point.
-    auto isLocalAhead = [&]() {
-      if (remotePosition.spineIndex < 0) {
-        return localProgress.percentage > remoteProgress.percentage;  // mapping unavailable; fall back
-      }
-      if (currentSpineIndex != remotePosition.spineIndex) {
-        return currentSpineIndex > remotePosition.spineIndex;
-      }
-      if (currentPage != remotePosition.pageNumber) {
-        return currentPage > remotePosition.pageNumber;
-      }
-      if (hasLocalParagraphIndex && remotePosition.hasParagraphIndex) {
-        return localParagraphIndex > remotePosition.paragraphIndex;
-      }
-      return false;
-    };
-    selectedOption = isLocalAhead() ? 1 /* Upload local */ : 0 /* Apply remote */;
-  }
-  requestUpdate(true);
 }
 
 void KOReaderSyncActivity::performUpload() {
@@ -754,4 +578,217 @@ void KOReaderSyncActivity::loop() {
     }
     return;
   }
+}
+
+bool KOReaderSyncActivity::calculateDocumentHash() {
+  // Calculate document hash based on user's preferred method
+  if (KOREADER_STORE.getMatchMethod() == DocumentMatchMethod::FILENAME) {
+    documentHash = KOReaderDocumentId::calculateFromFilename(epubPath);
+  } else {
+    documentHash = KOReaderDocumentId::calculate(epubPath);
+  }
+  if (documentHash.empty()) {
+    {
+      RenderLock lock(*this);
+      state = SYNC_FAILED;
+      statusMessage = tr(STR_HASH_FAILED);
+    }
+    
+    requestUpdate(true);
+    return false;
+  }
+  return true;
+}
+
+void KOReaderSyncActivity::compare() {
+
+  updateUI(state, []() {tr(STR_FETCH_PROGRESS);});
+
+  // Keep the GET connection alive so Upload can reuse the same session and
+  // avoid a second TLS handshake under fragmented heap.
+  KOReaderSyncClient::beginPersistentSession();
+
+  if (!fetchRemoteProgress()) return;
+
+  // Prepare remote mapping state for the next step.
+  prepareRemoteMapping();
+
+  // Compare intent keeps the legacy chooser flow (apply vs upload), which is
+  // still useful for manual conflict decisions.
+  // Pre-map remote progress now so compare UI always shows concrete chapter/
+  // page data. The mapped result is cached and reused if Apply is chosen.
+  if (!ensureRemotePositionMapped(false)) {
+    updateUI(SYNC_FAILED,[this]() {
+      statusMessage = tr(STR_SYNC_FAILED_MSG);
+    });
+    return;
+  }
+
+  // Local progress was precomputed before network; keep using the cached value.
+  releaseEpubForMapping();
+
+  {
+    RenderLock lock(*this);
+    state = SHOWING_RESULT;
+
+    // Default to the option that corresponds to the furthest progress.
+    // Compare in the shared CrossPoint coordinate system (spine → page → paragraph)
+    // rather than percentage, since percentages are derived differently on each
+    // side and lose resolution. Remote has already been mapped via
+    // ensureRemotePositionMapped() at this point.
+    auto isLocalAhead = [&]() {
+      if (remotePosition.spineIndex < 0) {
+        return localProgress.percentage > remoteProgress.percentage;  // mapping unavailable; fall back
+      }
+      if (currentSpineIndex != remotePosition.spineIndex) {
+        return currentSpineIndex > remotePosition.spineIndex;
+      }
+      if (currentPage != remotePosition.pageNumber) {
+        return currentPage > remotePosition.pageNumber;
+      }
+      if (hasLocalParagraphIndex && remotePosition.hasParagraphIndex) {
+        return localParagraphIndex > remotePosition.paragraphIndex;
+      }
+      return false;
+    };
+    selectedOption = isLocalAhead() ? 1 /* Upload local */ : 0 /* Apply remote */;
+  }
+  requestUpdate(true);
+}
+
+void KOReaderSyncActivity::pullRemote() {
+
+  updateUI(state, []() {tr(STR_FETCH_PROGRESS);});
+
+  // Keep the GET connection alive so Upload can reuse the same session and
+  // avoid a second TLS handshake under fragmented heap.
+  KOReaderSyncClient::beginPersistentSession();
+
+  if (!fetchRemoteProgress()) return;
+  
+  // Prepare remote mapping state for the next step.
+  prepareRemoteMapping();
+
+  // Pull intent applies immediately and exits. We bypass chooser UI to keep
+  // reader menu actions deterministic ("pull" always means apply remote).
+  if (!ensureRemotePositionMapped()) {
+    updateUI(SYNC_FAILED,[this]() {
+      statusMessage = tr(STR_SYNC_FAILED_MSG);
+    });
+    return;
+  }
+
+  // Preserve the apply result and show explicit confirmation before returning
+  // to the reader so users can tell pull succeeded.
+  auto& sync = APP_STATE.koReaderSyncSession;
+  sync.outcome = KOReaderSyncOutcomeState::APPLIED_REMOTE;
+  sync.resultSpineIndex = remotePosition.spineIndex;
+  sync.resultPage = remotePosition.pageNumber;
+  sync.resultParagraphIndex = remotePosition.paragraphIndex;
+  sync.resultHasParagraphIndex = remotePosition.hasParagraphIndex;
+  APP_STATE.saveToFile();
+  
+  updateUI(APPLY_COMPLETE,[this]() {
+    uploadCompleteTime = millis();
+  });
+
+  return;
+}
+
+void KOReaderSyncActivity::pushLocal() {
+  // Push intent skips comparison UI but still warms an HTTP/TLS session first
+  // so PUT can reuse the connection instead of forcing a fresh handshake.
+
+  // Direct push previously started with no reusable HTTP/TLS session, forcing
+  // a fresh handshake in updateProgress. Compare flow often succeeds because
+  // upload reuses the GET session. Warm the session here so push can take the
+  // same reuse path without showing comparison UI.
+  KOReaderSyncClient::beginPersistentSession();
+  KOReaderProgress warmupProgress;
+
+  const auto warmupResult = KOReaderSyncClient::getProgress(documentHash, warmupProgress);
+  
+  if (warmupResult != KOReaderSyncClient::OK && warmupResult != KOReaderSyncClient::NOT_FOUND) {
+
+    KOReaderSyncClient::endPersistentSession();
+
+    updateUI(SYNC_FAILED, [this, &warmupResult]() {
+      statusMessage = KOReaderSyncClient::errorString(warmupResult);
+      const char* detail = KOReaderSyncClient::lastFailureDetail();
+      if (detail && detail[0]) {
+        statusMessage += " — ";
+        statusMessage += detail;
+      }
+    });
+
+    return;
+  }
+
+  performUpload();
+
+  return;
+}
+
+
+void KOReaderSyncActivity::updateUI(State newState, auto&& runInCriticalSection, bool wait) {
+  {
+    RenderLock lock(*this);
+    state = newState;
+  
+    runInCriticalSection();
+  }
+
+  if (wait) {
+    requestUpdateAndWait();
+  } else {
+    requestUpdate(true);
+  }
+}
+
+void KOReaderSyncActivity::prepareRemoteMapping() {
+  hasRemoteProgress = false;
+  remotePositionMapped = false;
+  remotePosition.spineIndex = -1;
+  remotePosition.pageNumber = -1;
+  remotePosition.totalPages = 0;
+  remotePosition.paragraphIndex = 0;
+  remotePosition.hasParagraphIndex = false;
+  remoteChapterLabel.clear();
+}
+
+bool KOReaderSyncActivity::fetchRemoteProgress() {
+
+  // Fetch remote progress
+  const auto result = KOReaderSyncClient::getProgress(documentHash, remoteProgress);
+
+  if (result == KOReaderSyncClient::NOT_FOUND) {
+    // Keep session open so an immediate upload can reuse the same connection.
+    // No remote progress - offer to upload
+
+    updateUI(NO_REMOTE_PROGRESS,[this]() {
+      tr(STR_NO_REMOTE_MSG);
+      hasRemoteProgress = false;
+    });
+    
+    return false;
+  }
+
+  if (result != KOReaderSyncClient::OK) {
+    KOReaderSyncClient::endPersistentSession();
+
+    updateUI(SYNC_FAILED, [this, &result]() {
+      // Combine the short category label with the rich diagnostic so users (and bug
+      // reports) can tell network/TLS/server/heap failures apart at a glance.
+      statusMessage = KOReaderSyncClient::errorString(result);
+      const char* detail = KOReaderSyncClient::lastFailureDetail();
+      if (detail && detail[0]) {
+        statusMessage += " — ";
+        statusMessage += detail;
+      }
+    });
+
+    return false;
+  }
+
+  return true;
 }
